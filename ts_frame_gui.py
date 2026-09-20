@@ -52,6 +52,7 @@ class App(ctk.CTk):
         saved = _load_settings()
 
         self.grid_columnconfigure(0, weight=1)
+        self.grid_rowconfigure(2, weight=1)
 
         header = ctk.CTkFrame(self, fg_color="transparent")
         header.grid(row=0, column=0, sticky="ew", padx=24, pady=(20, 8))
@@ -71,7 +72,7 @@ class App(ctk.CTk):
         self._drop_host.bind("<Button-1>", lambda _e: self._browse_input())
         self._drop_label.bind("<Button-1>", lambda _e: self._browse_input())
 
-        body = ctk.CTkScrollableFrame(self, fg_color="transparent", height=260)
+        body = ctk.CTkFrame(self, fg_color="transparent")
         body.grid(row=2, column=0, sticky="nsew", padx=24, pady=(0, 8))
         body.grid_columnconfigure(1, weight=1)
 
@@ -101,7 +102,8 @@ class App(ctk.CTk):
         ctk.CTkLabel(opts, text="视频 PID (hex)").grid(row=0, column=0, sticky="w", padx=(0, 8))
         self._pid_var = StringVar(value=saved.get("pid", "0x12d"))
         ctk.CTkEntry(opts, textvariable=self._pid_var, width=90).grid(row=0, column=1, sticky="w")
-        ctk.CTkLabel(opts, text="例: 0x12d / 300").grid(row=0, column=2, sticky="w", padx=(10, 8))
+        ctk.CTkLabel(opts, text="例: 0x12d / 300", text_color=("gray40", "gray65")).grid(
+            row=0, column=2, sticky="w", padx=(14, 14))
         ctk.CTkButton(opts, text="检测视频PID", width=110, command=self._detect_pids).grid(row=0, column=3)
         self._pids_box = ctk.CTkTextbox(opts, height=56)
         self._pids_box.grid(row=1, column=0, columnspan=4, sticky="ew", pady=(6, 0))
