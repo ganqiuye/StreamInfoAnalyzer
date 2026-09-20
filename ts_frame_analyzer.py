@@ -563,12 +563,7 @@ footer{margin-top:24px;color:var(--mut);font-size:12px}
 <canvas id="cv" height="86"></canvas>
 </div>
 <div class="legend">
-  <span class="dot" style="background:#ff2a6d"></span>分辨率切换
-  <span class="dot" style="background:#ffec3d"></span>PTS跳变
-  <span class="dot" style="background:#ff4d6d"></span>损坏帧
-  <span class="dot" style="background:#22c5a8"></span>码率突刺
-  <span class="dot" style="background:#c0a6ff"></span>duration变化
-  <span class="dot" style="background:#7bd88f"></span>场/帧切换
+  <span class="dot" style="background:#ff2a6d"></span>异常帧(悬停看类型)
   <span class="dot" style="background:#ff9f1c"></span>IDR
   <span class="dot" style="background:#ffd24a"></span>I
   <span class="dot" style="background:#4cc9f0"></span>P
@@ -612,19 +607,13 @@ var N=FRAMES.length,cv=document.getElementById('cv'),ctx=cv.getContext('2d');
 var PXF=3; // 每帧像素宽, 总宽=N*PXF, 超宽时压缩
 function fit(){cv.style.width='';var ideal=N*PXF;cv.width=Math.min(ideal,32000);draw();}
 function draw(){var W=cv.width,H=86;ctx.clearRect(0,0,W,H);
- var px=N/W;
- for(var i=0;i<N;i++){var f=FRAMES[i],x=i/N*W,w=Math.max(1,W/N);
-  var c='#3a3f4a';
-  if(f.type==='I')c='#ffd24a';else if(f.type==='P')c='#4cc9f0';
-  if(f.idr)c='#ff9f1c';
-  if(f.anomalies&&f.anomalies.length){
-    if(f.anomalies.join().indexOf('损坏')>=0)c='#ff4d6d';
-    if(f.anomalies.join().indexOf('PTS跳变')>=0)c='#ffec3d';
-    if(f.anomalies.join().indexOf('码率突刺')>=0)c='#22c5a8';
-    if(f.anomalies.join().indexOf('duration')>=0)c='#c0a6ff';
-    if(f.anomalies.join().indexOf('分辨率切换')>=0)c='#ff2a6d';
-    if(f.anomalies.join().indexOf('场/帧')>=0)c='#7bd88f';}
-  ctx.fillStyle=c;ctx.fillRect(i/N*W,8,w,H-16);}}
+ for(var i=0;i<N;i++){var f=FRAMES[i];
+  var c='#3a3f4a';                       // B
+  if(f.type==='I')c='#ffd24a';           // I
+  else if(f.type==='P')c='#4cc9f0';      // P
+  if(f.idr)c='#ff9f1c';                  // IDR 覆盖 I
+  if(f.anomalies&&f.anomalies.length)c='#ff2a6d';  // 异常帧统一红色
+  ctx.fillStyle=c;ctx.fillRect(i/N*W,8,Math.max(1,W/N),H-16);}}
 fit();
 cv.onmousemove=function(e){var r=cv.getBoundingClientRect(),i=Math.floor((e.clientX-r.left)/r.width*N);
  if(i>=0&&i<N){var f=FRAMES[i],t=document.getElementById('tip');
