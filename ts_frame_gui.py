@@ -294,7 +294,7 @@ class App(ctk.CTk):
             try:
                 mid = T.check_midstream_change(str(inp))
                 frames = T.analyze(str(inp), pid, progress)
-                res_dist, type_dist, switches = T.summarize(frames)
+                res_dist, type_dist, switches, codec_dist, codec_switches = T.summarize(frames)
                 T.detect_anomalies(frames)
                 os.makedirs(outdir, exist_ok=True)
                 base = os_path_join(outdir, "pid_0x%x" % pid)
@@ -305,6 +305,8 @@ class App(ctk.CTk):
                 nd = sum(1 for f in frames if f.get("dur_change") is not None)
                 nf = sum(1 for f in frames if f.get("field_change"))
                 msg = "完成 — %d 帧 | PTS跳变 %d | duration变化边界 %d | 场/帧切换 %d" % (len(frames), nj, nd, nf)
+                if codec_dist and len(codec_dist) > 1:
+                    msg += " | 编码: %s" % "/".join(codec_dist)
                 if mid and not mid["ts_consistent"]:
                     for c in mid["ts_pmt_changes"]:
                         msg += "\n!! PMT 编码变化 @pkt#%d: %s" % (c["packet"], T.fmt_stream_types(c["new"]))
@@ -323,16 +325,18 @@ class App(ctk.CTk):
         import csv as csvmod, json as jsonmod
         with open(base + "_frames.csv", "w", newline="", encoding="utf-8") as fh:
             w = csvmod.writer(fh)
-            w.writerow(['disp_idx','decode_idx','pts_sec','pts_hms','type','pic_mode','width','height',
-                        'res_change','idr','has_sps','size','local_dur','dur_change','pts_jump','anomalies'])
+            w.writerow(['disp_idx','decode_idx','pts_sec','pts_hms','type','pic_mode','codec','width','height',
+                        'res_change','codec_change','idr','has_sps','size','local_dur','dur_change','pts_jump','anomalies'])
             for fr in frames:
                 r = fr['res']
                 w.writerow([fr.get('disp_idx', fr['idx']), fr['idx'],
                             '%.4f' % fr['pts'] if fr['pts'] is not None else '',
                             T.fmt_ts(fr['pts']) if fr['pts'] is not None else '', fr['type'],
                             fr.get('pic_mode') or '',
+                            fr.get('codec') or '',
                             r[0] if r else '', r[1] if r else '',
-                            int(fr['res_change']), int(fr['idr']), int(fr['has_sps']), fr['size'],
+                            int(fr['res_change']), int(fr.get('codec_change') or 0),
+                            int(fr['idr']), int(fr['has_sps']), fr['size'],
                             fr.get('local_dur') or '',
                             ('%.0fms' % (fr['dur_change']*1000)) if fr.get('dur_change') is not None else '',
                             fr.get('pts_jump') or '',

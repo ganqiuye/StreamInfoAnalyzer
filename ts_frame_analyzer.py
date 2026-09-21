@@ -272,6 +272,26 @@ def ts_demux_video(path, pid):
         aus.append((cur_pts, cur_dts, bytes(pes_buf)))
     return aus
 
+def sniff_au_codec(es):
+    """对单个 access unit 的 ES 头部做编码嗅探(精确 NAL 签名, 避免歧义):
+    返回 'H.264'/'H.265'/'MPEG2'/'MPEG4'/None"""
+    head = es[:4096]
+    for codec, rx in _AU_SIGS:
+        if rx.search(head):
+            return codec
+    return None
+
+
+# AU 级签名: HEVC 用两字节 NAL 头(type<<1|tid), H.264 用单字节(type&0x1F)
+# 顺序敏感: 先 H.265 再 H.264; H.264 特征(09 F0 AUD / 67 SPS / 68 PPS / 65 IDR)
+# 与 HEVC NAL 头不冲突
+_AU_SIGS = [
+    ("H.265",  re.compile(rb"\x00\x00\x01[\x00\x02\x26\x28\x40\x42\x44\x46\x4E][\x01\x02]")),
+    ("H.264",  re.compile(rb"\x00\x00\x01(?:\x09[\xF0-\xF7]|[\x67\x68\x65\x61\x41])")),
+    ("MPEG2",  re.compile(rb"\x00\x00\x01[\xB3\xB5\xB8\x00]")),
+    ("MPEG4",  re.compile(rb"\x00\x00\x01[\xB0\xB5\x20\x21]")),
+]
+
 # ------------------------------------------------------------ NAL parsing
 def find_start_codes(buf):
     pos = []
@@ -380,6 +400,55 @@ def parse_sps_ext(rbsp_raw):
 
 SLICE_TYPE = {0:'P',1:'B',2:'I',3:'SP',4:'SI',5:'I',6:'P',7:'B',8:'SP',9:'SI'}
 
+# HEVC slice_type (ue(v), 仅有 0/1/2 合法: B/P/I)
+HEVC_SLICE_TYPES = ['B', 'P', 'I']
+
+# HEVC slice_type -> 帧类别; 非 VCL NAL 返回 None
+def hevc_slice_type(nal_type, payload):
+    """从 HEVC slice segment header 提取帧类型。
+    payload = 起始码后第 1 字节起(即 NAL 头第 2 字节), 跳过它读 slice header。"""
+    if nal_type in (19, 20, 21):
+        return 'I'
+    if nal_type > 9:
+        return None
+    br = BitReader(strip_ep(payload[1:16]))  # payload[0] 是 NAL 头第 2 字节
+    try:
+        br.u(1)   # first_slice_segment_in_pic_flag
+        if nal_type in (19, 20, 21):
+            br.u(1)  # no_output_of_prior_pics
+        br.ue()   # slice_pic_parameter_set_id
+        st = br.ue()
+        return HEVC_SLICE_TYPES[st] if st < 3 else '?'
+    except Exception:
+        return '?'
+
+def parse_hevc_sps(rbsp_raw):
+    """解析 HEVC SPS, 返回 (width, height)。rbsp_raw = NAL payload(2 字节头之后)"""
+    br = BitReader(strip_ep(rbsp_raw))
+    br.u(4)                      # sps_video_parameter_set_id
+    max_sub = br.u(3) + 1
+    br.u(1)                      # temporal_id_nesting
+    br.u(2)                      # general_profile_space
+    br.u(1)                      # general_tier_flag
+    br.u(5)                      # general_profile_idc
+    br.u(32)                     # general_profile_compatibility_flag[32]
+    br.u(1)                      # progressive_source
+    br.u(1)                      # interlaced_source
+    br.u(1)                      # non_packed
+    br.u(1)                      # frame_only
+    br.u(44)                     # reserved 44 bits (含 inbld, 实测校正: 43 会错位)
+    for _ in range(max_sub - 1):
+        br.u(8)                  # sub_layer presentation flags
+    br.u(8)                      # general_level_idc
+    br.ue()                      # sps_seq_parameter_set_id
+    cf = br.ue()                 # chroma_format_idc
+    if cf == 3:
+        br.u(1)                  # separate_colour_plane_flag
+    w = br.ue(); h = br.ue()     # pic_width / pic_height_in_luma_samples
+    return (w, h)
+
+SLICE_TYPE = {0:'P',1:'B',2:'I',3:'SP',4:'SI',5:'I',6:'P',7:'B',8:'SP',9:'SI'}
+
 # 简化版: 直接按位读取, 由调用方传入 fmof/log2_mfn
 def slice_info(nal_type, payload, fmof, log2_mfn):
     """返回 (slice_type, field_pic_flag, frame_num)。fmof/log2_mfn 来自当前 SPS。"""
@@ -406,6 +475,8 @@ def analyze(path, pid, progress=None):
     cur_res = None
     sps_cache = {}
     cur_sps_ext = (None, 6, 1)  # (res, log2_mfn, fmof)
+    cur_codec = None            # 当前 AU 编码 ('H.264'/'H.265'/...)
+    codec_stats = {}            # codec -> 帧数
     for i, (pts, dts, es) in enumerate(aus):
         codes = find_start_codes(es)
         ftype = None
@@ -413,37 +484,66 @@ def analyze(path, pid, progress=None):
         has_sps = has_idr = False
         field_pic = None
         frame_num = None
+        # AU 级编码嗅探(头部 4KB): 与全局 PMT/ES 检查独立, 逐帧给出编码
+        au_codec = sniff_au_codec(es)
+        if au_codec:
+            cur_codec = au_codec
+        codec_change = False
+        if au_codec and codec_stats and au_codec not in codec_stats:
+            codec_change = True
         for idx, (off, scl) in enumerate(codes):
             start = off + scl
             end = codes[idx+1][0] if idx+1 < len(codes) else len(es)
-            nal = es[start] & 0x1F
+            first_byte = es[start]
             payload = es[start+1:end]
-            if nal == 7:
-                has_sps = True
-                key = bytes(payload[:24])
-                if key in sps_cache:
-                    res, cur_sps_ext = sps_cache[key], sps_cache[key + b'_ext']
-                else:
-                    try:
-                        ext = parse_sps_ext(payload)
-                        res = (ext[0], ext[1])
-                        cur_sps_ext = (res, ext[2], ext[3])
-                        sps_cache[key] = res
-                        sps_cache[key + b'_ext'] = cur_sps_ext
-                    except Exception:
-                        res = None
-            elif nal == 5:
-                has_idr = True
-            if nal in (1, 5):
-                info = slice_info(nal, payload, cur_sps_ext[2], cur_sps_ext[1])
-                if ftype is None:
-                    ftype = info[0]
-                if info[1] is not None:
-                    field_pic = info[1]
-                if info[2] is not None:
-                    frame_num = info[2]
+            if cur_codec == 'H.265':
+                # HEVC: 两字节 NAL 头, type=(b0>>1)&0x3F
+                nal = (first_byte >> 1) & 0x3F
+                if nal == 33:  # SPS
+                    has_sps = True
+                    key = bytes(payload[:24])
+                    if key in sps_cache:
+                        res = sps_cache[key]
+                    else:
+                        try:
+                            res = parse_hevc_sps(payload[1:])  # 跳过第 2 字节 NAL 头
+                            sps_cache[key] = res
+                        except Exception:
+                            res = None
+                elif nal in (19, 20):
+                    has_idr = True
+                if nal <= 9 or nal in (16, 17, 18, 19, 20, 21):
+                    ftype = hevc_slice_type(nal, payload)
+            else:
+                nal = first_byte & 0x1F
+                if nal == 7:
+                    has_sps = True
+                    key = bytes(payload[:24])
+                    if key in sps_cache:
+                        res, cur_sps_ext = sps_cache[key], sps_cache[key + b'_ext']
+                    else:
+                        try:
+                            ext = parse_sps_ext(payload)
+                            res = (ext[0], ext[1])
+                            cur_sps_ext = (res, ext[2], ext[3])
+                            sps_cache[key] = res
+                            sps_cache[key + b'_ext'] = cur_sps_ext
+                        except Exception:
+                            res = None
+                elif nal == 5:
+                    has_idr = True
+                if nal in (1, 5):
+                    info = slice_info(nal, payload, cur_sps_ext[2], cur_sps_ext[1])
+                    if ftype is None:
+                        ftype = info[0]
+                    if info[1] is not None:
+                        field_pic = info[1]
+                    if info[2] is not None:
+                        frame_num = info[2]
         if ftype is None:
             ftype = 'non-VCL'
+        if au_codec:
+            codec_stats[au_codec] = codec_stats.get(au_codec, 0) + 1
         res_change = bool(res and cur_res and res != cur_res)
         if res:
             cur_res = res
@@ -456,7 +556,8 @@ def analyze(path, pid, progress=None):
                        'res_change': res_change, 'has_sps': has_sps,
                        'idr': has_idr, 'size': len(es), 'pts_jump': None,
                        'corrupted': corrupted, 'field_pic': field_pic,
-                       'frame_num': frame_num})
+                       'frame_num': frame_num, 'codec': cur_codec,
+                       'codec_change': codec_change})
         if progress and i % 500 == 0:
             progress(i, len(aus))
     # 报告以显示顺序为主序: 按 PTS 排序, 保留解码序号
@@ -600,7 +701,13 @@ def detect_anomalies(frames):
 
     # ---- 汇总 anomaly 标签 ----
     global_dur = 0.04
+    prev_codec = None
     for f in frames:
+        c = f.get('codec')
+        if c and prev_codec and c != prev_codec:
+            f['anomalies'].append('编码切换%s→%s' % (prev_codec, c))
+        if c:
+            prev_codec = c
         if f.get('res_change'): f['anomalies'].append('分辨率切换')
         j = f.get('pts_jump')
         if j is not None:
@@ -622,6 +729,7 @@ def detect_anomalies(frames):
 
 def summarize(frames):
     res_dist = {}; type_dist = {}; switches = []
+    codec_dist = {}; codec_switches = []
     for fr in frames:
         if fr['res']:
             k = '%dx%d' % fr['res']
@@ -629,7 +737,12 @@ def summarize(frames):
         type_dist[fr['type']] = type_dist.get(fr['type'], 0) + 1
         if fr['res_change']:
             switches.append(fr)
-    return res_dist, type_dist, switches
+        c = fr.get('codec')
+        if c:
+            codec_dist[c] = codec_dist.get(c, 0) + 1
+        if fr.get('codec_change'):
+            codec_switches.append(fr)
+    return res_dist, type_dist, switches, codec_dist, codec_switches
 
 def fmt_ts(t):
     if t is None: return '-'
@@ -646,7 +759,7 @@ def build_html(frames, res_dist, type_dist, switches, path, pid, src_name):
             k = a.split('%')[0].split('+')[0].split('-')[0]
             by_kind[k] = by_kind.get(k, 0) + 1
     kind_badge = ''.join('<span class="badge %s">%s ×%d</span>' % (
-        {'分辨率切换':'bk-res','PTS跳变':'bk-pts','PTS回跳':'bk-pts','PTS间隔过小':'bk-oth','数据异常':'bk-cor','码率突刺':'bk-spk','SPS参数变更':'bk-sps','场/帧模式切换':'bk-fld','duration变为':'bk-dur','PTS':'bk-pts','duration':'bk-dur'}.get(k,'bk-oth'),
+        {'分辨率切换':'bk-res','PTS跳变':'bk-pts','PTS回跳':'bk-pts','PTS间隔过小':'bk-oth','数据异常':'bk-cor','码率突刺':'bk-spk','SPS参数变更':'bk-sps','场/帧模式切换':'bk-fld','duration变为':'bk-dur','PTS':'bk-pts','duration':'bk-dur','编码切换':'bk-cdc'}.get(k,'bk-oth'),
         k, v) for k, v in sorted(by_kind.items(), key=lambda x:-x[1]))
     type_rows = ' / '.join('<b>%s</b>: %d' % (k, v) for k, v in sorted(type_dist.items()))
     res_rows = ' / '.join('<b>%s</b>: %d 帧' % (k, v) for k, v in sorted(res_dist.items(), key=lambda x:-x[1]))
@@ -679,6 +792,7 @@ def build_html(frames, res_dist, type_dist, switches, path, pid, src_name):
         if fr.get('anomalies'): cls = 'anomaly ' + cls
         marks = []
         if fr.get('res_change'): marks.append('<b class="mk">⟲分辨率切换</b>')
+        if fr.get('codec_change'): marks.append('<b class="mk mk-cdc">⇆编码切换→%s</b>' % fr.get('codec','?'))
         if fr.get('pts_jump') is not None: marks.append('<b class="mk mk-pts">⏱PTS%+.2fs</b>' % fr['pts_jump'])
         if fr.get('corrupted'): marks.append('<b class="mk mk-cor">✖损坏</b>')
         if fr.get('size_spike'): marks.append('<b class="mk mk-spk">▲突刺</b>')
@@ -716,6 +830,7 @@ h1{font-size:20px;margin:0 0 4px}.sub{color:var(--mut);font-size:13px;margin-bot
 .bk-res{background:#5a1030;color:#ff9ecd}.bk-pts{background:#3a2e10;color:#ffd24a}
 .bk-cor{background:#40151a;color:#ff8a9a}.bk-spk{background:#123a3a;color:#6ee7d8}
 .bk-sps{background:#2a2040;color:#c0a6ff}.bk-fld{background:#143a22;color:#7bd88f}
+.bk-cdc{background:#3a1a04;color:#ffb84d;font-weight:600}
 .bk-dur{background:#241a3a;color:#c0a6ff}.bk-oth{background:#262a33;color:#aab}
 h2{font-size:15px;margin:26px 0 10px;display:flex;align-items:center;gap:8px}
 h2 .cnt{font-size:11px;background:#2d6a4f;color:#fff;border-radius:10px;padding:1px 8px}
@@ -729,7 +844,7 @@ tr.idr td{background:#33220c}
 tr.res-switch td{background:#4d0f2a !important;color:#ffb3d1;font-weight:600}
 tr.anomaly td{background:#2d1114 !important}
 tr.anomaly td:first-child{border-left:3px solid var(--red)}
-.mk{margin-left:6px;font-size:11px}.idrm{color:var(--org)}.mk-pts{color:var(--yel)}.mk-cor{color:var(--red)}.mk-spk{color:#6ee7d8}.mk-dur{color:#c0a6ff}.mk-fld{color:#7bd88f}.pm{color:#5a6272;font-size:10px;margin-left:4px}
+.mk{margin-left:6px;font-size:11px}.idrm{color:var(--org)}.mk-pts{color:var(--yel)}.mk-cor{color:var(--red)}.mk-spk{color:#6ee7d8}.mk-dur{color:#c0a6ff}.mk-fld{color:#7bd88f}.mk-cdc{color:#ffb84d;font-weight:600}.pm{color:#5a6272;font-size:10px;margin-left:4px}
 .tag{display:inline-block;background:#402028;color:#ff9aae;border-radius:8px;padding:0 8px;font-size:11px;margin-right:4px}
 .panel{background:var(--card);border:1px solid var(--line);border-radius:10px;padding:6px 0;max-height:320px;overflow:auto;margin:8px 0}
 #scroll{max-height:60vh;overflow:auto;border:1px solid var(--line);border-radius:10px}
@@ -882,21 +997,23 @@ def main():
             print('  已解析 %d 帧...' % i, file=sys.stderr)
     print('解析 %s (pid=0x%x) ...' % (ts_path, pid), file=sys.stderr)
     frames = analyze(ts_path, pid, prog)
-    res_dist, type_dist, switches = summarize(frames)
+    res_dist, type_dist, switches, codec_dist, codec_switches = summarize(frames)
     detect_anomalies(frames)
     base = os.path.join(outdir, 'pid_0x%x' % pid)
     with open(base + '_frames.csv', 'w', newline='', encoding='utf-8') as fh:
         w = csv.writer(fh)
-        w.writerow(['disp_idx','decode_idx','pts_sec','pts_hms','type','pic_mode','width','height',
-                    'res_change','idr','has_sps','size','local_dur','dur_change','pts_jump','anomalies'])
+        w.writerow(['disp_idx','decode_idx','pts_sec','pts_hms','type','pic_mode','codec','width','height',
+                    'res_change','codec_change','idr','has_sps','size','local_dur','dur_change','pts_jump','anomalies'])
         for fr in frames:
             r = fr['res']
             w.writerow([fr.get('disp_idx', fr['idx']), fr['idx'],
                         '%.4f' % fr['pts'] if fr['pts'] is not None else '',
                         fmt_ts(fr['pts']) if fr['pts'] is not None else '', fr['type'],
                         fr.get('pic_mode') or '',
+                        fr.get('codec') or '',
                         r[0] if r else '', r[1] if r else '',
-                        int(fr['res_change']), int(fr['idr']), int(fr['has_sps']), fr['size'],
+                        int(fr['res_change']), int(fr.get('codec_change') or 0),
+                        int(fr['idr']), int(fr['has_sps']), fr['size'],
                         fr.get('local_dur') or '',
                         ('%.0fms' % (fr['dur_change']*1000)) if fr.get('dur_change') is not None else '',
                         fr.get('pts_jump') or '',
@@ -908,6 +1025,12 @@ def main():
     print('帧数: %d' % len(frames))
     print('帧类型: %s' % type_dist)
     print('分辨率: %s' % res_dist)
+    if codec_dist:
+        print('编码: %s' % codec_dist)
+    if codec_switches:
+        print('编码切换点: %d' % len(codec_switches))
+        for f in codec_switches[:20]:
+            print('  帧 #%d  %s  -> %s' % (f['idx'], fmt_ts(f['pts']), f.get('codec')))
     print('分辨率切换点: %d' % len(switches))
     for f in switches[:100]:
         print('  帧 #%d  %s  -> %dx%d' % (f['idx'], fmt_ts(f['pts']), f['res'][0], f['res'][1]))
