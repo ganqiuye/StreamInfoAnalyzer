@@ -162,8 +162,8 @@ class App(ctk.CTk):
     def _set_input(self, p: Path):
         self._input_var.set(str(p))
         self._drop_label.configure(text="已选择\n%s" % p.name, fg="#e0e0e0", font=("Segoe UI", 14, "bold"))
-        if not self._outdir_var.get().strip():
-            self._outdir_var.set(str(p.parent))
+        # 输出目录默认跟随片源所在目录
+        self._outdir_var.set(str(p.parent))
 
     def _browse_input(self):
         p = filedialog.askopenfilename(title="选择 TS 片源",
