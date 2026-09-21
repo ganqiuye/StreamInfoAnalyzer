@@ -13,10 +13,206 @@ ts_frame_analyzer.py — TS 片源视频帧分析工具
 用法:
   python ts_frame_analyzer.py input.ts [video_pid_hex] [outdir]
   例: python ts_frame_analyzer.py sample.ts 0x12d ./out
-"""
-import sys, os, json, csv, datetime
 
-# ---------------------------------------------------------------- TS demux
+中流一致性检查 (mid-stream check):
+  ffmpeg 的 mpegts demuxer 只按首个 PMT 建流, 同一 PID 中途换编码
+  (PMT stream_type 变化)时它不会重新协商, 整段仍按旧编码报告。
+  本工具直接解析 TS 包跟踪 PMT 的 stream_type/PID 映射变化,
+  并对视频 PID 的 ES 做 NAL 特征嗅探交叉验证:
+    - ts_pmt_changes:  PMT 中 stream_type/PID 映射变化点(包号+新类型)
+    - codec_switches:  ES NAL 层编码切换点(h264/hevc/mpeg2/mpeg4)
+    - ts_consistent:   两者均无变化才为 True
+"""
+import sys, os, json, csv, datetime, re
+
+# ------------------------------------------------- TS mid-stream consistency
+# ffmpeg 的 mpegts demuxer 只按首个 PMT 建流, 同一 PID 中途换编码
+# (PMT stream_type 变化)时不会重新协商, 整段按旧编码报告。
+# 这里直接解析 TS 包: 跟踪 PMT 的 stream_type/PID 映射变化,
+# 并对视频 PID 的 ES 做 NAL 特征嗅探交叉验证。
+#
+# HEVC NAL 首字节(type=(b>>1)&0x3F): 32=VPS 33=SPS 34=PPS 19/20=IDR
+# H.264 NAL 首字节(type=b&0x1F):    7=SPS 8=PPS 5=IDR 9=AUD
+# MPEG2: 序列头 00 00 01 B3;  MPEG4: VOS 00 00 01 B0
+
+TS_PKT_SIZE = 188
+
+STREAM_TYPE_NAMES = {
+    0x01: "MPEG1", 0x02: "MPEG2", 0x03: "MP3", 0x04: "MPEG2", 0x0F: "AAC",
+    0x10: "MPEG4", 0x11: "AAC", 0x1B: "H.264", 0x24: "H.265", 0x42: "AVS2",
+    0x80: "MPEG2/PCM", 0x81: "AC3", 0x82: "DTS", 0x83: "TrueHD",
+}
+VIDEO_STREAM_TYPES = (0x01, 0x02, 0x10, 0x1B, 0x24, 0x42, 0x20)
+
+# NAL 特征签名: 在视频 PES 负载里搜索, 用于编码嗅探(与 PMT 交叉验证)
+_CODEC_SIGS = [
+    ("H.264",  re.compile(rb"\x00\x00\x01(?:\x09[\xF0-\xF7]|[\x67\x68\x41\x01\x61])")),
+    ("H.265",  re.compile(rb"\x00\x00\x01[\x40\x42\x44\x46\x26\x28][\x01\x02]")),
+    ("MPEG2",  re.compile(rb"\x00\x00\x01[\xB3\xB5\xB8\x00]")),
+    ("MPEG4",  re.compile(rb"\x00\x00\x01[\xB0\xB5\x20\x21]")),
+]
+
+
+def _ts_payload(pkt):
+    """取 TS 包有效负载; 无有效负载返回 None"""
+    if len(pkt) < TS_PKT_SIZE or pkt[0] != 0x47:
+        return None
+    afc = (pkt[3] >> 4) & 3
+    off = 4
+    if afc & 2:
+        off += 1 + pkt[4]
+    if not (afc & 1) or off >= 188:
+        return None
+    return pkt[off:188]
+
+
+def _parse_pmt_streams(sec):
+    """PMT section -> [(stream_type, es_pid), ...]; 非 PMT 或解析失败返回 None"""
+    if len(sec) < 12 or sec[0] != 0x02:
+        return None
+    section_len = ((sec[1] & 0x0F) << 8) | sec[2]
+    prog_info_len = ((sec[10] & 0x0F) << 8) | sec[11]
+    i = 12 + prog_info_len
+    streams = []
+    while i < 3 + section_len - 4:
+        if i + 5 > len(sec):
+            break
+        st = sec[i]
+        epid = ((sec[i + 1] & 0x1F) << 8) | sec[i + 2]
+        es_len = (sec[i + 3] << 8) | sec[i + 4]
+        streams.append((st, epid))
+        i += 5 + es_len
+    return streams
+
+
+def _iter_psi_sections(path, max_packets=None):
+    """逐包扫描, 产出 (packet_index, pid, section_bytes)。只跟踪 PAT/PMT。"""
+    buffers = {}
+    pmt_pids = set()
+    n = 0
+    with open(path, 'rb') as f:
+        while True:
+            pkt = f.read(TS_PKT_SIZE)
+            if len(pkt) < TS_PKT_SIZE:
+                break
+            n += 1
+            if max_packets and n > max_packets:
+                break
+            if pkt[0] != 0x47:
+                f.seek(-(TS_PKT_SIZE - 1), 1)  # 失步重同步
+                continue
+            pid = ((pkt[1] & 0x1F) << 8) | pkt[2]
+            if pid != 0 and pid not in pmt_pids:
+                continue
+            payload = _ts_payload(pkt)
+            if payload is None:
+                continue
+            if (pkt[1] >> 6) & 1:  # PUSI: pointer_field
+                ptr = payload[0]
+                buf = buffers.setdefault(pid, bytearray())
+                buf.clear()
+                buf += payload[1 + ptr:]
+                while len(buf) >= 3 and buf[0] != 0xFF:
+                    table_id = buf[0]
+                    sec_len = ((buf[1] & 0x0F) << 8) | buf[2]
+                    if len(buf) < 3 + sec_len:
+                        break
+                    sec = bytes(buf[:3 + sec_len])
+                    del buf[:3 + sec_len]
+                    yield n, pid, sec
+                    if pid == 0 and table_id == 0x00:
+                        # PAT: 注册 program_map_PID
+                        body = sec[8:3 + sec_len - 4]
+                        for j in range(0, len(body) - 3, 4):
+                            prog = (body[j] << 8) | body[j + 1]
+                            pmt = ((body[j + 2] & 0x1F) << 8) | body[j + 3]
+                            if prog != 0:
+                                pmt_pids.add(pmt)
+            else:
+                buffers.setdefault(pid, bytearray()).extend(payload)
+
+
+def sniff_ts_codec_changes(path, max_packets=None):
+    """全流扫描 PMT, 返回 stream_type/PID 映射变化点列表。
+    [{packet, pmt_pid, old:[...], new:[...]}]"""
+    states = {}   # pmt_pid -> sorted tuple of (stream_type, es_pid)
+    changes = []
+    for n, pid, sec in _iter_psi_sections(path, max_packets):
+        if pid == 0 or sec[0] != 0x02:
+            continue
+        streams = _parse_pmt_streams(sec)
+        if not streams:
+            continue
+        key = tuple(sorted(streams))
+        if key and pid in states and states[pid] != key:
+            changes.append({
+                "packet": n,
+                "pmt_pid": pid,
+                "old": states[pid],
+                "new": key,
+            })
+        if key:
+            states[pid] = key
+    return changes
+
+
+def fmt_stream_types(streams):
+    return ", ".join("0x%04x=%s(0x%02x)" % (epid, STREAM_TYPE_NAMES.get(st, "?"), st)
+                     for st, epid in streams)
+
+
+def sniff_video_es_codec_switch(path, video_pids):
+    """对视频 PID 的 PES 负载做 NAL 编码嗅探, 返回切换点列表。
+    每个 PUSI PES 的首包负载按签名归类, 编码变化即记录。"""
+    cur = None
+    changes = []
+    with open(path, 'rb') as f:
+        n = 0
+        while True:
+            pkt = f.read(TS_PKT_SIZE)
+            if len(pkt) < TS_PKT_SIZE:
+                break
+            n += 1
+            if pkt[0] != 0x47:
+                continue
+            pid = ((pkt[1] & 0x1F) << 8) | pkt[2]
+            if pid not in video_pids or not ((pkt[1] >> 6) & 1):
+                continue
+            payload = _ts_payload(pkt)
+            if payload is None:
+                continue
+            for codec, rx in _CODEC_SIGS:
+                if rx.search(payload):
+                    if cur is not None and codec != cur:
+                        changes.append({"packet": n, "from": cur, "to": codec})
+                    cur = codec
+                    break
+    return changes
+
+
+def check_midstream_change(path, max_packets=None):
+    """完整中流检查。返回 dict:
+      ts_pmt_changes / codec_switches / ts_consistent / video_pids
+    对非 TS 容器返回 None。"""
+    if not str(path).lower().endswith((".ts", ".m2ts", ".mts", ".trp")):
+        return None
+    pmt_changes = sniff_ts_codec_changes(path, max_packets)
+    video_pids = set()
+    for _, _, sec in _iter_psi_sections(path, max_packets=200_000):
+        streams = _parse_pmt_streams(sec)
+        if streams:
+            for st, epid in streams:
+                if st in VIDEO_STREAM_TYPES:
+                    video_pids.add(epid)
+    codec_switches = sniff_video_es_codec_switch(path, video_pids) if video_pids else []
+    return {
+        "ts_pmt_changes": pmt_changes,
+        "codec_switches": codec_switches,
+        "video_pids": sorted(video_pids),
+        "ts_consistent": not pmt_changes and not codec_switches,
+    }
+
+# ------------------------------------------------- TS demux
 def ts_demux_video(path, pid):
     """返回 [(pts_or_None, dts_or_None, es_bytes), ...] 每个元素一个 PES(access unit)"""
     aus = []
@@ -649,10 +845,38 @@ def main():
     if len(sys.argv) < 2:
         print(__doc__); sys.exit(1)
     ts_path = sys.argv[1]
-    pid = int(sys.argv[2], 0) if len(sys.argv) > 2 else 0x12d
     outdir = sys.argv[3] if len(sys.argv) > 3 else os.path.dirname(os.path.abspath(ts_path))
     if outdir and not os.path.exists(outdir):
         os.makedirs(outdir)
+
+    # ---- 中流一致性检查: PMT stream_type 变化 + ES NAL 编码嗅探 ----
+    print('中流一致性检查 ...', file=sys.stderr)
+    mid = check_midstream_change(ts_path)
+    if mid is not None:
+        if mid['ts_pmt_changes']:
+            for c in mid['ts_pmt_changes']:
+                print('!! PMT stream_type 变化 @ packet #%d:' % c['packet'], file=sys.stderr)
+                print('   旧: %s' % fmt_stream_types(c['old']), file=sys.stderr)
+                print('   新: %s' % fmt_stream_types(c['new']), file=sys.stderr)
+        if mid['codec_switches']:
+            for c in mid['codec_switches']:
+                print('!! ES 编码切换 @ packet #%d: %s -> %s (PID 见 video_pids)'
+                      % (c['packet'], c['from'], c['to']), file=sys.stderr)
+        if not mid['ts_consistent']:
+            print('>> 该流同一 PID 中途换编码, ffmpeg 单次探测只会报首段编码;'
+                  ' 建议按切换点分包分析', file=sys.stderr)
+        else:
+            print('中流检查: 一致 (无 PMT/编码变化)', file=sys.stderr)
+
+    # ---- 未指定 PID 时: 有且仅有一个视频 PID 则直接用之 ----
+    if len(sys.argv) > 2:
+        pid = int(sys.argv[2], 0)
+    elif mid and len(mid['video_pids']) == 1:
+        pid = mid['video_pids'][0]
+        print('自动选择视频 PID: 0x%x' % pid, file=sys.stderr)
+    else:
+        pid = 0x12d
+
     def prog(i, n):
         if i % 5000 == 0:
             print('  已解析 %d 帧...' % i, file=sys.stderr)

@@ -292,6 +292,7 @@ class App(ctk.CTk):
 
         def worker():
             try:
+                mid = T.check_midstream_change(str(inp))
                 frames = T.analyze(str(inp), pid, progress)
                 res_dist, type_dist, switches = T.summarize(frames)
                 T.detect_anomalies(frames)
@@ -304,6 +305,12 @@ class App(ctk.CTk):
                 nd = sum(1 for f in frames if f.get("dur_change") is not None)
                 nf = sum(1 for f in frames if f.get("field_change"))
                 msg = "完成 — %d 帧 | PTS跳变 %d | duration变化边界 %d | 场/帧切换 %d" % (len(frames), nj, nd, nf)
+                if mid and not mid["ts_consistent"]:
+                    for c in mid["ts_pmt_changes"]:
+                        msg += "\n!! PMT 编码变化 @pkt#%d: %s" % (c["packet"], T.fmt_stream_types(c["new"]))
+                    for c in mid["codec_switches"]:
+                        msg += "\n!! 编码切换 @pkt#%d: %s→%s" % (c["packet"], c["from"], c["to"])
+                    msg += "\n(ffmpeg 只报首段编码, 结果仅覆盖首段)"
                 self._result = ("ok", html_path, msg)
             except Exception as exc:
                 tb = traceback.format_exc()
@@ -347,8 +354,9 @@ class App(ctk.CTk):
         if res is not None:
             self._result = None
             if res[0] == "ok":
-                self._done(res[1])
-                self._status_var.set("%s（%ds）" % (res[2], int(time.time() - self._started)))
+                self._done(res[1], res[2])
+                if "!!" not in res[2]:
+                    self._status_var.set("%s（%ds）" % (res[2], int(time.time() - self._started)))
             else:
                 self._fail(res[1])
             return
@@ -361,7 +369,7 @@ class App(ctk.CTk):
             self._status_var.set("%s（%ds）" % (self._stage, int(time.time() - self._started)))
         self._timer_job = self.after(500, self._tick)
 
-    def _done(self, html_path):
+    def _done(self, html_path, msg=None):
         self._busy = False
         self._progress.stop(); self._progress.grid_remove()
         if self._timer_job:
@@ -369,7 +377,11 @@ class App(ctk.CTk):
         self._analyze_btn.configure(state="normal")
         self._open_btn.configure(state="normal")
         self._last_report = html_path
-        self._status_var.set("完成 — %s（%ds）" % (html_path, int(time.time() - self._started)))
+        if msg and "!!" in msg:
+            self._status_var.set("完成 — 检测到中流编码变化!（%ds）" % int(time.time() - self._started))
+            messagebox.showwarning("中流编码变化", msg)
+        else:
+            self._status_var.set("完成 — %s（%ds）" % (html_path, int(time.time() - self._started)))
         if self._open_var.get():
             self._open_report()
 
