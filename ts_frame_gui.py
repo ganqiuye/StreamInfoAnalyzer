@@ -99,16 +99,18 @@ class App(ctk.CTk):
         opts = ctk.CTkFrame(body, fg_color="transparent")
         opts.grid(row=r, column=0, columnspan=2, sticky="ew", pady=(10, 4))
         opts.grid_columnconfigure(1, weight=1)
-        ctk.CTkLabel(opts, text="视频 PID (hex)").grid(row=0, column=0, sticky="w", padx=(0, 8))
+        ctk.CTkLabel(opts, text="视频 PID").grid(row=0, column=0, sticky="w", padx=(0, 8))
         self._pid_var = StringVar(value=saved.get("pid", "0x12d"))
-        ctk.CTkEntry(opts, textvariable=self._pid_var, width=90).grid(row=0, column=1, sticky="w")
-        ctk.CTkLabel(opts, text="例: 0x12d / 300", text_color=("gray40", "gray65")).grid(
+        self._pid_menu = ctk.CTkOptionMenu(opts, variable=self._pid_var,
+                                           values=["0x12d"], width=150,
+                                           command=lambda _v: None)
+        self._pid_menu.grid(row=0, column=1, sticky="w")
+        ctk.CTkLabel(opts, text="选择片源后自动检测; 也可手输后回车", text_color=("gray40", "gray65")).grid(
             row=0, column=2, sticky="w", padx=(14, 14))
-        ctk.CTkButton(opts, text="检测视频PID", width=110, command=self._detect_pids).grid(row=0, column=3)
-        self._pids_box = ctk.CTkTextbox(opts, height=56)
-        self._pids_box.grid(row=1, column=0, columnspan=4, sticky="ew", pady=(6, 0))
-        self._pids_box.insert("end", "提示: 不确定 PID 时点\"检测视频PID\"，将列出片源中的视频流")
-        self._pids_box.configure(state="disabled")
+        self._pid_entry = ctk.CTkEntry(opts, width=90, placeholder_text="0x12d")
+        self._pid_entry.grid(row=0, column=3, sticky="w")
+        self._pid_entry.bind("<Return>", self._on_manual_pid)
+        ctk.CTkButton(opts, text="重新检测", width=90, command=self._detect_pids).grid(row=0, column=3, padx=(100, 0))
 
         r += 1
         flags = ctk.CTkFrame(body, fg_color="transparent")
@@ -164,6 +166,7 @@ class App(ctk.CTk):
         self._drop_label.configure(text="已选择\n%s" % p.name, fg="#e0e0e0", font=("Segoe UI", 14, "bold"))
         # 输出目录默认跟随片源所在目录
         self._outdir_var.set(str(p.parent))
+        self.after(0, self._detect_pids)  # 拉取码流后自动检测视频 PID
 
     def _browse_input(self):
         p = filedialog.askopenfilename(title="选择 TS 片源",
@@ -177,40 +180,46 @@ class App(ctk.CTk):
             self._outdir_var.set(p)
 
     # ---------- PID 检测 ----------
+    def _on_manual_pid(self, _evt=None):
+        v = self._pid_entry.get().strip()
+        if v:
+            try:
+                int(v, 0)
+                self._pid_var.set(v)
+                self._pid_menu.configure(values=[v])
+            except ValueError:
+                messagebox.showerror("参数错误", "PID 格式错误，请用 0x12d 这类格式")
+
     def _detect_pids(self):
         path = self._input_var.get().strip()
         if not path:
-            messagebox.showerror("错误", "请先选择片源文件")
             return
-        self._pids_box.configure(state="normal")
-        self._pids_box.delete("1.0", "end")
-        self._pids_box.insert("end", "扫描中…")
-        self._pids_box.configure(state="disabled")
+        self._pid_menu.configure(values=["扫描中…"])
+        self._pid_var.set("扫描中…")
 
         def worker():
             try:
                 pids = self._scan_video_pids(path)
-            except Exception as exc:
+            except Exception:
                 pids = []
-                msg = str(exc)
-            else:
-                msg = None
+            self._pid_result = pids  # 线程安全: 主线程 _tick 轮询
 
-            def done():
-                self._pids_box.configure(state="normal")
-                self._pids_box.delete("1.0", "end")
-                if msg:
-                    self._pids_box.insert("end", "扫描失败: %s" % msg)
-                elif not pids:
-                    self._pids_box.insert("end", "未发现 H.264/H.265 视频流")
-                else:
-                    self._pids_box.insert("end", "视频流: " + ", ".join(pids))
-                    self._pid_var.set(pids[0].split("(")[0])
-                self._pids_box.configure(state="disabled")
-
-            self.after(0, done)
-
+        self._pid_result = None
         threading.Thread(target=worker, daemon=True).start()
+        self.after(300, self._poll_pids)
+
+    def _poll_pids(self):
+        pr = getattr(self, "_pid_result", None)
+        if pr is not None:
+            self._pid_result = None
+            if not pr:
+                self._pid_menu.configure(values=["未检出"])
+                self._pid_var.set("未检出")
+            else:
+                self._pid_menu.configure(values=pr)
+                self._pid_var.set(pr[0].split("(")[0])
+        elif "扫描中" in self._pid_var.get():
+            self.after(300, self._poll_pids)
 
     @staticmethod
     def _scan_video_pids(path: str):
@@ -258,9 +267,9 @@ class App(ctk.CTk):
             messagebox.showerror("参数错误", "请先选择片源文件")
             return
         try:
-            pid = int(self._pid_var.get().strip(), 0)
+            pid = int(self._pid_var.get().split("(")[0].strip(), 0)
         except ValueError:
-            messagebox.showerror("参数错误", "PID 格式错误，请用 0x12d 这类格式")
+            messagebox.showerror("参数错误", "PID 无效，请重新检测或手动输入")
             return
         inp = Path(path)
         if not inp.is_file():
@@ -325,6 +334,15 @@ class App(ctk.CTk):
             jsonmod.dump(frames, fh, ensure_ascii=False)
 
     def _tick(self):
+        pr = getattr(self, "_pid_result", None)
+        if pr is not None:
+            self._pid_result = None
+            if not pr:
+                self._pid_menu.configure(values=["未检出"])
+                self._pid_var.set("未检出")
+            else:
+                self._pid_menu.configure(values=pr)
+                self._pid_var.set(pr[0].split("(")[0])
         res = getattr(self, "_result", None)
         if res is not None:
             self._result = None
