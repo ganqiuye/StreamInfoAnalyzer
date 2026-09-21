@@ -5,6 +5,7 @@ rem  双击运行即可; 产物在 dist\TS帧分析工具\
 rem ============================================
 chcp 65001 >nul
 cd /d "%~dp0"
+set PYTHONPATH=
 
 set PY=C:\Users\qiuye.gan\AppData\Local\Programs\Python\Python38\python.exe
 if not exist "%PY%" set PY=python
