@@ -477,6 +477,7 @@ def analyze(path, pid, progress=None):
     cur_sps_ext = (None, 6, 1)  # (res, log2_mfn, fmof)
     cur_codec = None            # 当前 AU 编码 ('H.264'/'H.265'/...)
     codec_stats = {}            # codec -> 帧数
+    prev_codec_for_switch = None
     for i, (pts, dts, es) in enumerate(aus):
         codes = find_start_codes(es)
         ftype = None
@@ -544,6 +545,11 @@ def analyze(path, pid, progress=None):
             ftype = 'non-VCL'
         if au_codec:
             codec_stats[au_codec] = codec_stats.get(au_codec, 0) + 1
+        # 解码序上的真实编码切换(仅此帧标记, 显示序 PTS 交错会导致误判)
+        codec_switch_label = None
+        if codec_change:
+            codec_switch_label = '编码切换%s→%s' % (prev_codec_for_switch or '?', au_codec)
+        prev_codec_for_switch = au_codec or cur_codec
         res_change = bool(res and cur_res and res != cur_res)
         if res:
             cur_res = res
@@ -557,7 +563,8 @@ def analyze(path, pid, progress=None):
                        'idr': has_idr, 'size': len(es), 'pts_jump': None,
                        'corrupted': corrupted, 'field_pic': field_pic,
                        'frame_num': frame_num, 'codec': cur_codec,
-                       'codec_change': codec_change})
+                       'codec_change': codec_change,
+                       'codec_switch_label': codec_switch_label})
         if progress and i % 500 == 0:
             progress(i, len(aus))
     # 报告以显示顺序为主序: 按 PTS 排序, 保留解码序号
@@ -700,14 +707,13 @@ def detect_anomalies(frames):
             prev_fpf = fpf
 
     # ---- 汇总 anomaly 标签 ----
+    # 注意: 编码切换只在【解码序】的 codec_change 帧上标记(analyze 已打 codec_switch_label)。
+    # 显示序按 PTS 排序, 两个编码段的 PTS 可能重叠(如本例 H.264 段 0~31s, H.265 段从 1.44s 起),
+    # 按显示序比较 prev_codec 会把交错的帧误判成频繁切换。
     global_dur = 0.04
-    prev_codec = None
     for f in frames:
-        c = f.get('codec')
-        if c and prev_codec and c != prev_codec:
-            f['anomalies'].append('编码切换%s→%s' % (prev_codec, c))
-        if c:
-            prev_codec = c
+        if f.get('codec_switch_label'):
+            f['anomalies'].append(f['codec_switch_label'])
         if f.get('res_change'): f['anomalies'].append('分辨率切换')
         j = f.get('pts_jump')
         if j is not None:
