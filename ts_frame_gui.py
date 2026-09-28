@@ -18,7 +18,9 @@ sys.path.insert(0, str(Path(__file__).resolve().parent))
 import ts_frame_analyzer as T
 
 SETTINGS_PATH = Path.home() / ".tsframe-gui.json"
-VERSION = "1.0"
+VERSION = "1.1"
+APP_NAME = "TS 帧分析工具"
+APP_AUTHOR = "qiuye.gan"
 
 
 def _load_settings() -> dict:
@@ -76,6 +78,8 @@ class App(ctk.CTk):
         ctk.CTkLabel(header, text="TS 帧分析工具", font=ctk.CTkFont(size=24, weight="bold")).grid(row=0, column=0, sticky="w")
         ctk.CTkLabel(header, text="拖拽 TS 片源，逐帧分析并生成可视化 HTML 报告",
                      font=ctk.CTkFont(size=13), text_color=("gray40", "gray65")).grid(row=1, column=0, sticky="w", pady=(4, 0))
+        ctk.CTkLabel(header, text="v%s · by %s" % (VERSION, APP_AUTHOR),
+                     font=ctk.CTkFont(size=11), text_color=("gray50", "gray60")).grid(row=0, column=1, sticky="e")
 
         # 拖拽区
         self._drop_host = tk.Frame(self, bg="#1c1c1c", highlightthickness=2,

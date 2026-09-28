@@ -44,6 +44,7 @@ def main():
         "--windowed",               # 无控制台
         "--icon", str(ROOT / "assets" / "logo.ico"),  # exe 图标
         "--add-data", str(ROOT / "assets" / "logo.ico") + ";assets",  # 窗口图标随包分发
+        "--version-file", str(ROOT / "version_info.py"),  # exe 版本/作者信息
         "--collect-all", "customtkinter",
         "--collect-all", "tkinterdnd2",
         "--distpath", str(ROOT / "dist"),
