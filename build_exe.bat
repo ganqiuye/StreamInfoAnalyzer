@@ -18,13 +18,18 @@ if errorlevel 1 (
     exit /b 1
 )
 
-echo [2/3] 开始编译...
-%PY% build_exe.py
-if errorlevel 1 (
-    echo [!] 编译失败
-    pause
-    exit /b 1
-)
+%PY% build_exe.py || goto :fail
+
+rem  把 logo.ico 拷进产物目录，供桌面快捷方式使用
+copy /Y "%~dp0assets\logo.ico" "%~dp0dist\TS帧分析工具\logo.ico" >nul
+copy /Y "%~dp0CreateShortcut.bat" "%~dp0dist\TS帧分析工具\CreateShortcut.bat" >nul
 
 echo [3/3] 完成! 产物: %~dp0dist\TS帧分析工具\TS帧分析工具.exe
+echo  发送桌面: 双击 dist\TS帧分析工具\CreateShortcut.bat
 pause
+exit /b 0
+
+:fail
+echo [!] 编译失败
+pause
+exit /b 1
