@@ -36,6 +36,22 @@ def _save_settings(d: dict) -> None:
 
 
 class App(ctk.CTk):
+    def _set_app_icon(self) -> None:
+        """设置窗口/任务栏图标（兼容源码运行与 PyInstaller 打包）"""
+        import sys
+        base = getattr(sys, "_MEIPASS", None)
+        candidates = []
+        if base:
+            candidates.append(Path(base) / "assets" / "logo.ico")
+        candidates.append(Path(__file__).resolve().parent / "assets" / "logo.ico")
+        for icon in candidates:
+            if icon.is_file():
+                try:
+                    self.iconbitmap(str(icon))
+                except Exception:
+                    pass
+                return
+
     def __init__(self) -> None:
         super().__init__()
         ctk.set_appearance_mode("dark")
@@ -43,6 +59,7 @@ class App(ctk.CTk):
         self.title("TS 帧分析工具 v%s" % VERSION)
         self.geometry("700x620")
         self.minsize(620, 540)
+        self._set_app_icon()
 
         self._busy = False
         self._timer_job = None

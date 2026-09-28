@@ -42,6 +42,8 @@ def main():
         "--clean",
         "--name", APP_NAME,
         "--windowed",               # 无控制台
+        "--icon", str(ROOT / "assets" / "logo.ico"),  # exe 图标
+        "--add-data", str(ROOT / "assets" / "logo.ico") + ";assets",  # 窗口图标随包分发
         "--collect-all", "customtkinter",
         "--collect-all", "tkinterdnd2",
         "--distpath", str(ROOT / "dist"),
