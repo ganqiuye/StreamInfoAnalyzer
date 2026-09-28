@@ -60,8 +60,16 @@ def main():
 
     exe = DIST / (APP_NAME + ".exe")
     if exe.is_file():
+        # 把 logo.ico 和桌面快捷方式脚本拷进产物目录，供发送桌面用
+        import shutil
+        for extra in ("assets/logo.ico", "CreateShortcut.bat"):
+            src = ROOT / extra
+            if src.is_file():
+                shutil.copy2(src, DIST / src.name)
+
         size_mb = exe.stat().st_size / 1024 / 1024
         print("\n[OK] 编译完成: %s (%.0f MB)" % (exe, size_mb))
+        print("     发送桌面: 双击 %s\\CreateShortcut.bat" % DIST)
         print("     分发时把整个文件夹 %s 打包成 zip 给用户即可" % DIST)
     else:
         print("[!] 未找到产物:", exe)
