@@ -2,6 +2,9 @@
 
 对 MPEG-TS 片源做逐帧分析，检测分辨率切换、I/P/B 帧类型切换、PTS 跳变、duration 变化（20ms↔40ms 场/帧编码切换）、码率突刺、损坏帧等异常，输出可交互 HTML 报告（时间轴可左右滑动、点击定位、异常帧明细）。
 
+<img width="2483" height="1029" alt="1" src="https://github.com/user-attachments/assets/a0cad53d-6a0e-4241-b0ed-fd3c43146136" />
+
+
 ## 打开 GUI
 
 **方式一（推荐）**：双击 `ts_frame_gui.pyw`（无控制台窗口）。
